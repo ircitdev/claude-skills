@@ -2,9 +2,10 @@
 name: telegram-lead-crm
 description: |
   Sets up a complete lead capture pipeline: React form → Express API → Telegram Bot + Google Sheets CRM.
-  Includes email-gate for PDF lead magnets (with HTML email via Resend/SMTP), UTM tracking, deep links
-  with source attribution, Yandex.Metrika goals, centralized marketing config, and an auto-updating
-  analytics dashboard in Google Sheets.
+  Includes email-gate for PDF lead magnets (HTML email via Resend API), inbound email forwarding to
+  Telegram topics, Resend webhook tracking (opens/clicks/bounces), UTM tracking, deep links with source
+  attribution, Yandex.Metrika goals, centralized client+server configs, and an auto-updating analytics
+  dashboard in Google Sheets with 4 sheets (Leads, Dashboard, Email Events, Inbox).
 
   USE THIS SKILL when the user wants to:
   - Add a lead form or contact form that sends to Telegram
@@ -17,48 +18,57 @@ description: |
   - Integrate Google Sheets as a lightweight CRM
   - Add Yandex.Metrika goals to a React site
   - Send transactional emails from a landing page
+  - Forward inbound emails to Telegram
+  - Track email opens and clicks
   - Create a centralized marketing config
+  - Set up Resend for transactional email
 
   Also trigger when the user mentions: "лид-форма", "сбор лидов", "заявки в телеграм", "CRM в гугл таблице",
-  "отслеживание UTM", "воронка лидов", "email-gate", "lead magnet", "lead pipeline", "resend", "pdf скачивание".
+  "отслеживание UTM", "воронка лидов", "email-gate", "lead magnet", "lead pipeline", "resend", "pdf скачивание",
+  "входящая почта в телеграм", "email tracking", "inbound email".
 ---
 
 # Telegram Lead Pipeline + Google Sheets CRM
 
-Production-ready lead capture for React/Vite sites. Every lead flows through a secure server-side API to Telegram (instant notification), Google Sheets (CRM with dashboard), and optionally email (PDF lead magnets).
+Production-ready lead capture for React/Vite sites. Every lead flows through a secure server-side API to Telegram (instant notification with topic support), Google Sheets (CRM with auto-dashboard), and optionally email (PDF lead magnets via Resend).
 
 ## Architecture
 
 ```
-                    ┌─────────────────┐
-                    │  src/config.ts  │  Central marketing config
-                    └────────┬────────┘
-                             │
-          ┌──────────────────┼──────────────────┐
-          ▼                  ▼                   ▼
-  ┌──────────────┐  ┌───────────────┐  ┌──────────────┐
-  │  Lead Form   │  │  Email-Gate   │  │  All CTAs    │
-  │  (Modals)    │  │  (PDF gate)   │  │  deep links  │
-  └──────┬───────┘  └──────┬────────┘  └──────────────┘
-         │                 │
-         ▼                 ▼
-  POST /api/send-lead   POST /api/send-pdf
-         │                 │
-         ▼                 ▼
-  ┌────────────────────────────────────┐
-  │  Express API (server-side only)    │
-  │  Secrets in .env, never in client  │
-  └──────┬─────────┬─────────┬────────┘
-         │         │         │
-         ▼         ▼         ▼
-   Telegram   Google Sheets  Email
-   Bot API    Apps Script    (Resend SMTP)
-   (+ topic)  (CRM+Dashboard)
+                    ┌──────────────┐     ┌──────────────┐
+                    │ src/config.ts│     │ api/config.ts│
+                    │ (client)     │     │ (server)     │
+                    └──────┬───────┘     └──────┬───────┘
+                           │                    │
+        ┌──────────────────┼────────┐           │
+        ▼                  ▼        ▼           │
+ ┌────────────┐  ┌───────────┐ ┌────────┐      │
+ │ Lead Form  │  │ Email-Gate│ │All CTAs│      │
+ │ (Modals)   │  │(PDF gate) │ │deeplink│      │
+ └─────┬──────┘  └─────┬─────┘ └────────┘      │
+       │               │                        │
+       ▼               ▼                        ▼
+POST /api/send-lead  POST /api/send-pdf   POST /api/inbound-email
+       │               │                  POST /api/resend-webhook
+       │               │                        │
+       ▼               ▼                        ▼
+┌───────────────────────────────────────────────────────┐
+│  Express API (server-side only, secrets in api/config) │
+└──┬──────────┬──────────┬──────────┬───────────────────┘
+   │          │          │          │
+   ▼          ▼          ▼          ▼
+Telegram  Google Sheets  Email    Telegram
+Bot API   Apps Script    Resend   (inbox topic)
+(+topic)  (CRM+Dash)    API
 ```
 
-## Step 1: Centralized config
+## Two config files
 
-Create `src/config.ts` — single source of truth for all marketing parameters on the client side. Server secrets stay in `.env`.
+The system uses **two separate config files** — one for client, one for server. This is critical for security.
+
+### Client config: `src/config.ts`
+
+Single source of truth for all marketing parameters visible to the browser. **No secrets here.**
 
 ```typescript
 // ===== BRAND =====
@@ -75,6 +85,7 @@ export const BRAND = {
 export const TELEGRAM = {
   botUsername: 'MyBot',
   botUrl: 'https://t.me/MyBot',
+  /** Deep link: ?start=action__source (max 64 chars) */
   deepLink: (action: string, source: string) =>
     `https://t.me/MyBot?start=${action}__${source}`,
 } as const;
@@ -96,7 +107,7 @@ export const ASSETS = {
   pdfUrl: 'https://...pdf',
 } as const;
 
-// ===== PACKAGES / PRICING =====
+// ===== PACKAGES =====
 export const PACKAGES = {
   basic: { name: 'Basic', price: '...', slug: 'basic' },
   pro:   { name: 'Pro',   price: '...', slug: 'pro' },
@@ -109,10 +120,12 @@ export const API = {
 } as const;
 
 // ===== UTM HELPERS =====
+const UTM_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term'] as const;
+
 export function getUtmParams(): Record<string, string> {
   const params = new URLSearchParams(window.location.search);
   const utm: Record<string, string> = {};
-  for (const key of ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term']) {
+  for (const key of UTM_KEYS) {
     const val = params.get(key);
     if (val) utm[key] = val;
   }
@@ -120,26 +133,101 @@ export function getUtmParams(): Record<string, string> {
 }
 
 export function packageSlug(pkg: string): string {
-  // Map display name → slug for deep links
   if (pkg.includes('Basic')) return 'basic';
   if (pkg.includes('Pro')) return 'pro';
   return 'general';
 }
 ```
 
-All components import from config instead of hardcoding values. The metrika helper uses `METRIKA.counterId`:
+### Server config: `api/config.ts`
+
+All secrets from `.env`, plus shared helpers for Telegram/Sheets. **Never import on client side.**
 
 ```typescript
-// src/metrika.ts
+// ===== TELEGRAM =====
+export const TG = {
+  botToken: process.env.TG_BOT_TOKEN || '',
+  chatId: process.env.TG_CHAT_ID || '',
+  threadId: process.env.TG_THREAD_ID || '',           // lead topic
+  inboxThreadId: process.env.TG_INBOX_THREAD_ID || '', // inbound email topic
+  apiUrl: (token: string) => `https://api.telegram.org/bot${token}/sendMessage`,
+} as const;
+
+// ===== GOOGLE SHEETS CRM =====
+export const SHEETS = {
+  webhook: process.env.GOOGLE_SHEET_WEBHOOK || '',
+} as const;
+
+// ===== RESEND (EMAIL) =====
+export const RESEND = {
+  apiKey: process.env.SMTP_PASS || '',
+  webhookSecret: process.env.RESEND_WEBHOOK_SECRET || '',
+  from: process.env.SMTP_FROM || 'Brand <info@example.com>',
+} as const;
+
+// ===== PDF & DEEP LINKS =====
+export const CONTENT = {
+  pdfUrl: 'https://...pdf',
+  botDeeplink: 'https://t.me/MyBot?start=free_audit__pdf_email',
+} as const;
+
+// ===== RATE LIMITING =====
+export const RATE = { maxRequests: 5, windowMs: 60 * 60 * 1000 } as const;
+
+// ===== HELPERS =====
+
+/** Send message to Telegram (default lead topic) */
+export async function sendTelegram(text: string, parseMode: 'Markdown' | 'HTML' = 'Markdown') {
+  if (!TG.botToken || !TG.chatId) return null;
+  const payload: Record<string, unknown> = {
+    chat_id: TG.chatId, text, parse_mode: parseMode,
+  };
+  if (TG.threadId) payload.message_thread_id = Number(TG.threadId);
+  return fetch(TG.apiUrl(TG.botToken), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+/** Send message to a specific Telegram topic */
+export async function sendTelegramToThread(text: string, threadId: string, parseMode: 'Markdown' | 'HTML' = 'HTML') {
+  if (!TG.botToken || !TG.chatId || !threadId) return null;
+  return fetch(TG.apiUrl(TG.botToken), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: TG.chatId, text, parse_mode: parseMode,
+      message_thread_id: Number(threadId),
+    }),
+  });
+}
+
+/** Send data to Google Sheets CRM */
+export async function sendToSheet(data: Record<string, unknown> | object) {
+  if (!SHEETS.webhook) return;
+  try {
+    await fetch(SHEETS.webhook, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+  } catch { /* best-effort */ }
+}
+```
+
+### Metrika helper: `src/metrika.ts`
+
+```typescript
 import { METRIKA } from './config';
 export function reachGoal(goal: string, params?: Record<string, unknown>) {
   if (window.ym) window.ym(METRIKA.counterId, 'reachGoal', goal, params);
 }
 ```
 
-## Step 2: Yandex.Metrika
+## Yandex.Metrika setup
 
-Add counter script in `index.html` `<head>`. The `<noscript>` pixel must go inside `<body>`, not `<head>` — Vite's HTML parser rejects block elements in `<head>`.
+Add counter in `index.html` `<head>`. The `<noscript>` pixel must go inside `<body>` — Vite rejects block elements in `<head>`.
 
 Goals to instrument:
 
@@ -151,14 +239,13 @@ Goals to instrument:
 | `pdf_download` | PDF email-gate submitted | — |
 | `email_captured` | Email collected (PDF gate) | `{ source: 'pdf_gate' }` |
 
-## Step 3: Telegram deep links with source tracking
+## Telegram deep links
 
-Every bot link uses format `?start=action__source` (max 64 chars). Use `TELEGRAM.deepLink()` helper from config.
+Format: `?start=action__source` (max 64 chars). Use `TELEGRAM.deepLink()` from client config.
 
 Examples:
 - `TELEGRAM.deepLink('zakazat_audit', 'hero')` → `?start=zakazat_audit__hero`
 - `TELEGRAM.deepLink('free_audit', 'pdf_gate')` → `?start=free_audit__pdf_gate`
-- `TELEGRAM.deepLink('free_audit', packageSlug(leadPackage))` → `?start=free_audit__basic`
 
 Bot-side parsing (Python):
 ```python
@@ -166,124 +253,104 @@ parts = payload.split('__', 1)
 action, source = parts[0], parts[1] if len(parts) > 1 else 'direct'
 ```
 
-## Step 4: Lead form
+## API endpoints
 
-Form collects user data + automatic analytics via config helpers:
+### POST /api/send-lead
+Lead form → Telegram (Markdown, with UTM/deeplink) + Google Sheets. Rate limited (5/hr/IP).
 
-```typescript
-import { API, TELEGRAM, getUtmParams, packageSlug } from '../config';
+### POST /api/send-pdf
+Email-gate → Resend API (branded HTML email with PDF + bot CTA) + Telegram + Sheets. Records `emailId` from Resend for tracking correlation.
 
-const handleSubmit = async () => {
-  const slug = packageSlug(leadPackage);
-  await fetch(API.sendLead, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      package: leadPackage,
-      name, company, phone, telegram, site, message,
-      deepLink: TELEGRAM.deepLink('free_audit', slug),
-      utm: getUtmParams(),
-      referrer: document.referrer || null,
-      page: window.location.href,
-    })
-  });
-};
-```
+### POST /api/resend-webhook
+Resend webhook receiver for email events (sent, delivered, opened, clicked, bounced, complained). Logs to Sheets "Email Events" sheet with color-coding. Notifies Telegram on opens/clicks.
 
-After success, show CTA to Telegram bot with tracking deep link.
+### POST /api/inbound-email
+Resend inbound email webhook. Forwards incoming emails to a dedicated Telegram topic. Logs to Sheets "Inbox" sheet with status tracking.
 
-## Step 5: Email-gate for PDF lead magnets
-
-Replace direct PDF download links with a name+email form. On submit:
-
-1. **Server sends HTML email** with PDF download button + CTA to Telegram bot
-2. **Lead recorded** in Telegram (notification) + Google Sheets (CRM row with package "PDF-презентация")
-3. **Metrika goals** fired: `email_captured` + `pdf_download`
-4. **Success screen** shows CTA to bot with deep link `free_audit__pdf_gate`
-
-Create `api/send-pdf.ts` endpoint that sends email via SMTP (Resend recommended), notifies Telegram, and writes to Sheets — all in parallel.
-
-**HTML email template** should include:
-- Branded header with logo/name
-- Personalized greeting
-- Big CTA button to download PDF
-- Secondary CTA block inviting to free Telegram bot audit (with tracking deep link `free_audit__pdf_email`)
-- Footer with contact info
-
-Use `nodemailer` for SMTP transport. Dynamic import so the server doesn't crash if nodemailer isn't installed — email sending gracefully degrades while TG/Sheets still work.
-
-## Step 6: Express API server
-
-**Critical:** All secrets (tokens, SMTP credentials) in `.env` only, never in client code.
-
-Two routers:
-- `api/send-lead.ts` — Lead form → Telegram + Sheets
-- `api/send-pdf.ts` — Email-gate → Email + Telegram + Sheets
-
-Both use rate limiting and send to all destinations in parallel.
+## Express server
 
 ```typescript
 // server.ts
+import express from 'express';
 import leadRouter from './api/send-lead.js';
 import pdfRouter from './api/send-pdf.js';
+import inboundRouter from './api/inbound-email.js';
+
+const app = express();
 app.use(express.json());
 app.use(leadRouter);
 app.use(pdfRouter);
+app.use(inboundRouter);
+app.use(express.static('dist'));
+app.get('*', (_req, res) => res.sendFile('dist/index.html'));
 ```
 
 Vite proxy for dev: `/api` → `localhost:3001`.
 
-## Step 7: Environment variables
+## Environment variables
 
 ```env
 # Telegram
 TG_BOT_TOKEN=...              # From @BotFather
-TG_CHAT_ID=...                # Target group ID
-TG_THREAD_ID=...              # Topic ID (optional)
+TG_CHAT_ID=...                # Target group ID (e.g. -1001234567890)
+TG_THREAD_ID=...              # Topic for leads (optional)
+TG_INBOX_THREAD_ID=...        # Topic for inbound emails (optional)
 
 # Google Sheets CRM
-GOOGLE_SHEET_WEBHOOK=...      # Apps Script web app URL
+GOOGLE_SHEET_WEBHOOK=...      # Apps Script web app URL (changes on each deploy!)
 
-# Email (Resend recommended — free 100/day)
-SMTP_HOST=smtp.resend.com
-SMTP_PORT=465
-SMTP_USER=resend
+# Email (Resend — free 100/day, 3000/month)
 SMTP_PASS=re_your_api_key     # Resend API key
 SMTP_FROM=Brand <info@example.com>
+RESEND_WEBHOOK_SECRET=whsec_... # For webhook signature verification
 ```
 
-**Resend setup** (simplest free option):
-1. resend.com → sign up
-2. Add domain → set 3 DNS records (DKIM, SPF, MX)
-3. Get API key → use as SMTP_PASS with `SMTP_USER=resend`
+### Resend setup
+1. resend.com → sign up → add domain → set 3 DNS records (DKIM, SPF for `send` subdomain)
+2. Set MX for `@` to `inbound-smtp.eu-west-1.resend.com.` priority 10 (for inbound email)
+3. Get API key → use as `SMTP_PASS`
+4. Webhooks in Resend dashboard:
+   - `https://yourdomain.com/api/resend-webhook` — events: all email.* events (tracking)
+   - `https://yourdomain.com/api/inbound-email` — event: email.received (inbox)
+5. Enable Click Tracking + Open Tracking in domain Configuration tab
 
-If SMTP not configured, email silently skipped — TG/Sheets still work.
+If Resend not configured, email silently skipped — TG/Sheets still work.
 
-## Step 8: Google Sheets CRM (Apps Script)
+## Google Sheets CRM (Apps Script)
 
-Sheet "Leads" — 21 columns:
+Deploy as web app (execute as me, access: anyone). The script creates 4 sheets automatically:
 
+### Sheet "Лиды" — 23 columns
 | # | Column | Auto | Description |
 |---|--------|:----:|-------------|
 | 1-2 | Date, Time | yes | Moscow timezone |
-| 3 | Package | yes | Plan name or "PDF-презентация" for email-gate |
-| 4-10 | Name, Company, Industry, Phone, TG, Site, Message | yes | Form fields |
-| 11 | Deep Link | yes | Bot link with source |
-| 12-16 | utm_source..utm_term | yes | From URL |
-| 17-18 | Referrer, Page | yes | Traffic source |
-| 19 | Status | manual | Dropdown: New → In progress → Paid / Rejected |
-| 20 | Manager comment | manual | Free text |
-| 21 | Deal amount | manual | For revenue calc |
+| 3 | Package | yes | Plan name or "PDF-презентация" |
+| 4-9 | Name, Company, Industry, Phone, TG, Email | yes | Form fields |
+| 10-11 | Site, Message | yes | Form fields |
+| 12-13 | Deep Link, Email ID | yes | Tracking |
+| 14-18 | utm_source..utm_term | yes | From URL |
+| 19-20 | Referrer, Page | yes | Traffic source |
+| 21 | Status | manual | Dropdown: Новый → В работе → Оплачен / Отказ |
+| 22 | Manager comment | manual | Free text |
+| 23 | Deal amount | manual | For revenue calc |
 
-Sheet "Dashboard" — auto-updates with KPIs, breakdowns by status/package/source, daily chart.
+### Sheet "Дашборд" — auto-updates
+KPIs (total leads, paid, conversion, revenue), breakdowns by status/package/source, daily chart, email tracking stats.
+
+### Sheet "Email события" — Resend tracking
+Date, Time, Event type (color-coded), Email, Email ID, Click URL, Timestamp.
+
+### Sheet "Входящие письма" — inbound email log
+Date, Time, From, To, Subject, Body preview, Attachments count, Status (dropdown: Новое/Прочитано/Отвечено/Спам).
 
 ## Telegram message formats
 
 **Lead form:**
 ```
-🚀 *NEW LEAD: Plan Name*
-👤 *Name:* John
-📞 *Phone:* +7...
+🚀 *НОВЫЙ ЛИД: Plan Name*
+
+👤 *Имя:* John
+📞 *Телефон:* +7...
 🔗 *Deep link:* https://t.me/Bot?start=free_audit__plan
 📊 *UTM:*  • utm_source: `yandex`
 ```
@@ -291,11 +358,49 @@ Sheet "Dashboard" — auto-updates with KPIs, breakdowns by status/package/sourc
 **PDF email-gate:**
 ```
 📩 *PDF-ПРЕЗЕНТАЦИЯ*
-👤 *Name:* John
+
+👤 *Имя:* John
 📧 *Email:* john@example.com
 🔗 *Deep link:* https://t.me/Bot?start=free_audit__pdf_email
-📊 *UTM:*  • utm_source: `yandex`
+📬 *Email ID:* `abc123`
 ```
+
+**Email tracking (on open/click):**
+```
+👁 Открыто *EMAIL TRACKING*
+
+📧 *To:* john@example.com
+📬 *Email ID:* `abc123`
+```
+
+**Inbound email (to inbox topic):**
+```
+📨 ВХОДЯЩЕЕ ПИСЬМО
+
+📧 От: sender@example.com
+📬 Кому: info@example.com
+📋 Тема: Subject line
+📎 Вложения: file.pdf (120 KB)
+
+─────────────────
+<body text>
+```
+
+## Post-submit flow
+
+After successful form submission, show a success screen with CTA to Telegram bot (free audit) using tracking deep link. Same pattern for email-gate — after email is sent, show bot CTA with `free_audit__pdf_gate` deep link.
+
+## HTML email template
+
+Branded dark theme email with:
+- Header: brand name + domain
+- Personalized greeting
+- Big orange CTA button → PDF download
+- Separator
+- Blue "bonus" block → free Telegram bot audit (with tracking deep link `free_audit__pdf_email`)
+- Footer: contact info + explanation why email was sent
+
+Use Resend SDK (`new Resend(apiKey)`) for sending — simpler than nodemailer, no SMTP config needed.
 
 ## Full funnel
 
@@ -303,7 +408,7 @@ Sheet "Dashboard" — auto-updates with KPIs, breakdowns by status/package/sourc
 Lead form submit                    PDF email-gate
     │                                    │
     ├─► Telegram (lead notification)     ├─► Telegram (pdf notification)
-    ├─► Google Sheets (CRM row)          ├─► Google Sheets (CRM row)
+    ├─► Google Sheets (CRM row)          ├─► Google Sheets (CRM row + emailId)
     ├─► Metrika (lead_form_submit)       ├─► Email with PDF + bot CTA
     │                                    ├─► Metrika (email_captured + pdf_download)
     ▼                                    ▼
@@ -315,19 +420,33 @@ CTA: "Free audit in bot"           CTA: "Free audit in bot"
     ▼                                    ▼
 Telegram bot                        Telegram bot
 (deep link: free_audit__<pkg>)      (deep link: free_audit__pdf_gate)
+
+
+Resend webhooks (async):            Inbound email:
+    │                                    │
+    ├─► email.opened/clicked             ├─► Telegram (inbox topic)
+    │   ├─► Sheets "Email Events"        ├─► Sheets "Incoming"
+    │   └─► Telegram notification        │
+    │                                    │
+    ├─► email.bounced/complained         │
+    │   └─► Sheets "Email Events"        │
 ```
 
 ## Checklist
 
-- [ ] `src/config.ts` with all brand/telegram/metrika/assets/api constants
-- [ ] `.env` with TG_BOT_TOKEN, TG_CHAT_ID, SMTP_*, GOOGLE_SHEET_WEBHOOK
-- [ ] Metrika counter in `index.html`, helper imports from config
-- [ ] All Telegram links use `TELEGRAM.deepLink()` from config
+- [ ] `src/config.ts` with BRAND, TELEGRAM, METRIKA, ASSETS, PACKAGES, API, UTM helpers
+- [ ] `api/config.ts` with TG, SHEETS, RESEND, CONTENT, RATE + helper functions
+- [ ] `.env` with TG_BOT_TOKEN, TG_CHAT_ID, TG_THREAD_ID, TG_INBOX_THREAD_ID, SMTP_PASS, SMTP_FROM, RESEND_WEBHOOK_SECRET, GOOGLE_SHEET_WEBHOOK
+- [ ] Metrika counter in `index.html` (noscript in body, not head)
+- [ ] `src/metrika.ts` imports counterId from config
+- [ ] All Telegram links use `TELEGRAM.deepLink()` from client config
 - [ ] `reachGoal()` on every CTA click and form submit
 - [ ] API tokens NOT in any client-side file
-- [ ] Email-gate for PDF with branded HTML email
-- [ ] Resend configured (domain DNS + API key in .env)
+- [ ] Email-gate with branded HTML email via Resend SDK
+- [ ] Resend domain verified (DKIM + SPF on `send` subdomain, MX on `@` for inbound)
+- [ ] Resend webhooks configured (tracking + inbound)
+- [ ] Click Tracking + Open Tracking enabled in Resend
 - [ ] Google Apps Script deployed, URL in `.env`
 - [ ] `setupSheets()` run once to create table structure
 - [ ] Metrika goals created in web interface (JS event type)
-- [ ] `nodemailer` in dependencies
+- [ ] `resend` package in dependencies (not nodemailer)
