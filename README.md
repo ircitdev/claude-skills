@@ -7,6 +7,7 @@
 | Навык | Описание | Стек |
 |-------|----------|------|
 | [telegram-lead-crm](skills/telegram-lead-crm/) | Лид-форма → Telegram + Google Sheets CRM с UTM и аналитикой | React, Express, Apps Script |
+| [ios-app](skills/ios-app/) | Сборка и публикация Flutter iOS-приложения в App Store через GitHub Actions | Flutter, Xcode, GitHub Actions |
 
 ## Быстрый старт
 
@@ -41,7 +42,7 @@ claude-skills/
 │   ├── telegram-lead-crm/      ← React → Telegram + Sheets CRM
 │   │   ├── SKILL.md            ← Инструкции для Claude
 │   │   └── README.md           ← Документация для человека
-│   ├── <next-skill>/           ← Следующий навык
+│   ├── ios-app/                ← Flutter iOS → App Store (GitHub Actions CI/CD)
 │   │   ├── SKILL.md
 │   │   └── README.md
 │   └── ...
