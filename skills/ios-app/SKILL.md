@@ -3,7 +3,7 @@ name: ios-app
 description: |
   Полный цикл подготовки, сборки и публикации Flutter iOS-приложения в App Store через GitHub Actions CI/CD.
   Включает: управление версиями, сборку через облачный CI, загрузку в TestFlight, подготовку метаданных
-  App Store (скриншоты, описание, политики), отслеживание статуса сборки.
+  App Store, управление версиями и сборками через App Store Connect API, подмену сборки на ревью.
 
   USE THIS SKILL when the user wants to:
   - Собрать и опубликовать iOS приложение
@@ -11,6 +11,9 @@ description: |
   - Увеличить версию или build number приложения
   - Настроить CI/CD для iOS через GitHub Actions
   - Подготовить приложение к публикации в App Store
+  - Подменить сборку на ревью на новую
+  - Отменить ревью и заменить версию
+  - Управлять версиями через App Store Connect API
   - Создать или обновить скриншоты для App Store
   - Настроить подпись iOS приложения (code signing)
   - Создать provisioning profile или сертификат
@@ -22,12 +25,12 @@ description: |
   Also trigger when the user mentions: "iOS релиз", "TestFlight", "App Store", "публикация iOS",
   "сборка iOS", "build number", "provisioning profile", "code signing", "Xcode", "IPA",
   "App Store Connect", "скриншоты для стора", "publish iOS", "iOS release", "flutter build ios",
-  "приложение ios", "загрузить в стор".
+  "приложение ios", "загрузить в стор", "подменить сборку", "заменить версию", "отменить ревью".
 ---
 
 # iOS App: Сборка и публикация Flutter-приложения в App Store
 
-Навык для полного цикла подготовки и публикации Flutter iOS-приложения через облачный CI/CD (GitHub Actions).
+Навык для полного цикла подготовки и публикации Flutter iOS-приложения через облачный CI/CD (GitHub Actions). Включает управление версиями через App Store Connect API.
 
 ## Архитектура CI/CD
 
@@ -45,71 +48,56 @@ App Store Connect / TestFlight
 
 ## Конфигурация проекта
 
-Перед началом работы определи параметры проекта. Типичная структура:
-
 | Параметр | Где найти |
 |----------|-----------|
 | Bundle ID | `ios/Runner.xcodeproj/project.pbxproj` → `PRODUCT_BUNDLE_IDENTIFIER` |
+| Apple ID | App Store Connect API: `GET /v1/apps?filter[bundleId]=...` |
 | Team ID | Apple Developer → Membership → Team ID |
 | Версия | `pubspec.yaml` → `version: X.Y.Z+buildNumber` |
 | GitHub Repo | `git remote -v` |
 | Workflow | `.github/workflows/ios-release.yml` |
+| API Key | `~/.appstoreconnect/private_keys/AuthKey_<KEY_ID>.p8` |
 
 ## Шаги публикации
 
 ### 1. Проверь текущее состояние
 
 ```bash
-# Текущая версия
 grep "^version:" pubspec.yaml
-
-# Статус git
 git status
-
-# Последние сборки
 gh run list --repo OWNER/REPO --limit 5
-
-# Последний коммит
-git log --oneline -3
 ```
 
 ### 2. Подготовь изменения
 
-Если нужно — внеси изменения в код, обнови зависимости, документацию.
+- Внеси изменения в код если нужно
+- **Если обновились версии Firebase** в `pubspec.yaml` — удали `ios/Podfile.lock` перед пушем. Локальный lock может содержать старые версии SDK, несовместимые с новыми плагинами. CI сгенерирует свежий.
 
 ### 3. Увеличь build number
 
-В `pubspec.yaml` увеличь число после `+` в поле `version`. Каждая загрузка в App Store Connect требует уникальный build number.
+В `pubspec.yaml` увеличь число после `+`. Каждая загрузка в App Store Connect требует уникальный build number.
 
 ```yaml
 # Было:
-version: 1.1.0+4
+version: 1.2.1+9
 # Стало:
-version: 1.1.0+5
-```
-
-Для нового релиза (не просто build) — увеличь и версию:
-```yaml
-version: 1.2.0+5
+version: 1.2.1+10
 ```
 
 ### 4. Закоммить и запушить
 
 ```bash
 git add -A
-git commit -m "Bump build number for iOS release"
+git commit -m "описание изменений"
 git push
 ```
 
 ### 5. Отследи сборку
 
 ```bash
-# Дождись запуска
 sleep 5
 RUN_ID=$(gh run list --repo OWNER/REPO --limit 1 --json databaseId -q '.[0].databaseId')
 echo "Build started: $RUN_ID"
-
-# Отслеживай в фоне
 gh run watch $RUN_ID --repo OWNER/REPO --exit-status
 ```
 
@@ -122,120 +110,104 @@ gh run watch $RUN_ID --repo OWNER/REPO --exit-status
 gh run view $RUN_ID --repo OWNER/REPO --log-failed | tail -30
 ```
 
-### 7. После загрузки
+## Управление версиями через App Store Connect API
 
-Напомни пользователю:
-- Обработка сборки в TestFlight занимает 5-30 минут
-- Для публикации в App Store нужны: скриншоты, описание, категория, возрастной рейтинг
-- Отправка на ревью Apple — 1-3 дня
+Для подмены сборки, отмены ревью и обновления версии используй REST API.
+
+### Аутентификация
+
+```python
+import jwt, time, requests, glob, os
+
+key_id = 'YOUR_KEY_ID'
+issuer_id = 'YOUR_ISSUER_ID'
+
+# Найти ключ на диске
+paths = glob.glob(os.path.expanduser('~/.appstoreconnect/private_keys/AuthKey_*.p8'))
+if not paths:
+    for root, dirs, files in os.walk(os.path.expanduser('~')):
+        for f in files:
+            if f.startswith('AuthKey_') and f.endswith('.p8'):
+                paths.append(os.path.join(root, f))
+        if paths:
+            break
+with open(paths[0], 'r') as f:
+    private_key = f.read()
+
+payload = {'iss': issuer_id, 'iat': int(time.time()), 'exp': int(time.time()) + 1200, 'aud': 'appstoreconnect-v1'}
+token = jwt.encode(payload, private_key, algorithm='ES256', headers={'kid': key_id})
+headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+```
+
+Зависимости: `pip3 install PyJWT cryptography requests`
+
+### Получить версии и сборки
+
+```python
+APP_ID = '...'  # Apple ID приложения
+
+# Версии App Store
+r = requests.get(f'https://api.appstoreconnect.apple.com/v1/apps/{APP_ID}/appStoreVersions?filter[platform]=IOS', headers=headers)
+for v in r.json()['data']:
+    print(f"Version: {v['attributes']['versionString']} | State: {v['attributes']['appStoreState']} | ID: {v['id']}")
+
+# Сборки (последние 5)
+r = requests.get(f'https://api.appstoreconnect.apple.com/v1/builds?filter[app]={APP_ID}&sort=-uploadedDate&limit=5', headers=headers)
+for b in r.json()['data']:
+    print(f"Build: {b['attributes']['version']} | State: {b['attributes']['processingState']} | ID: {b['id']}")
+```
+
+### Подмена сборки на ревью
+
+Полный процесс: отмена ревью → обновление версии → привязка нового build.
+
+```python
+VERSION_ID = '...'  # ID версии из списка
+BUILD_ID = '...'    # ID нового build из списка
+
+# 1. Отменить ревью (если WAITING_FOR_REVIEW)
+r = requests.get(f'https://api.appstoreconnect.apple.com/v1/appStoreVersions/{VERSION_ID}/appStoreVersionSubmission', headers=headers)
+if r.status_code == 200:
+    sub_id = r.json()['data']['id']
+    r2 = requests.delete(f'https://api.appstoreconnect.apple.com/v1/appStoreVersionSubmissions/{sub_id}', headers=headers)
+    print(f"Cancel review: {r2.status_code}")  # 204 = success
+
+# 2. Обновить номер версии (если нужно)
+requests.patch(
+    f'https://api.appstoreconnect.apple.com/v1/appStoreVersions/{VERSION_ID}',
+    headers=headers,
+    json={"data": {"type": "appStoreVersions", "id": VERSION_ID,
+                    "attributes": {"versionString": "1.2.1"}}}
+)
+
+# 3. Привязать новый build
+requests.patch(
+    f'https://api.appstoreconnect.apple.com/v1/appStoreVersions/{VERSION_ID}/relationships/build',
+    headers=headers,
+    json={"data": {"type": "builds", "id": BUILD_ID}}
+)
+
+# 4. Отправить на ревью — API Key НЕ имеет прав на submit
+# Попроси пользователя нажать «Отправить на проверку» в App Store Connect
+```
+
+### Найти Apple ID приложения
+
+```python
+r = requests.get('https://api.appstoreconnect.apple.com/v1/apps?filter[bundleId]=YOUR_BUNDLE_ID', headers=headers)
+app = r.json()['data'][0]
+print(f"Apple ID: {app['id']}, Name: {app['attributes']['name']}")
+```
 
 ## GitHub Actions workflow
 
-Минимальный workflow для Flutter iOS:
+Минимальный workflow для Flutter iOS — см. `.github/workflows/ios-release.yml` в проекте.
 
-```yaml
-name: iOS App Store Release
-
-on:
-  push:
-    branches: [main]
-  workflow_dispatch:
-
-jobs:
-  build-ios:
-    runs-on: macos-14
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer
-
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: '3.24.5'
-          channel: 'stable'
-
-      - name: Get dependencies
-        run: flutter pub get
-
-      - name: Install Apple certificate
-        env:
-          P12_BASE64: ${{ secrets.P12_BASE64 }}
-          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-        run: |
-          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
-          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
-          echo -n "$P12_BASE64" | base64 --decode -o $CERTIFICATE_PATH
-          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-          security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
-          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-          security list-keychain -d user -s $KEYCHAIN_PATH
-
-      - name: Setup App Store Connect API Key
-        env:
-          APP_STORE_API_KEY_P8: ${{ secrets.APP_STORE_API_KEY_P8 }}
-          APP_STORE_API_KEY_ID: ${{ secrets.APP_STORE_API_KEY_ID }}
-        run: |
-          mkdir -p ~/private_keys
-          echo "$APP_STORE_API_KEY_P8" > ~/private_keys/AuthKey_${APP_STORE_API_KEY_ID}.p8
-
-      - name: Build archive
-        env:
-          APP_STORE_API_KEY_ID: ${{ secrets.APP_STORE_API_KEY_ID }}
-          APP_STORE_API_ISSUER_ID: ${{ secrets.APP_STORE_API_ISSUER_ID }}
-        run: |
-          cd ios && pod install
-          xcodebuild -workspace Runner.xcworkspace \
-            -scheme Runner -configuration Release \
-            -archivePath $RUNNER_TEMP/Runner.xcarchive \
-            -destination 'generic/platform=iOS' \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath ~/private_keys/AuthKey_${APP_STORE_API_KEY_ID}.p8 \
-            -authenticationKeyID ${APP_STORE_API_KEY_ID} \
-            -authenticationKeyIssuerID ${APP_STORE_API_ISSUER_ID} \
-            DEVELOPMENT_TEAM=YOUR_TEAM_ID \
-            CODE_SIGN_STYLE=Automatic \
-            archive
-
-      - name: Export & Upload IPA
-        env:
-          APP_STORE_API_KEY_ID: ${{ secrets.APP_STORE_API_KEY_ID }}
-          APP_STORE_API_ISSUER_ID: ${{ secrets.APP_STORE_API_ISSUER_ID }}
-        run: |
-          xcodebuild -exportArchive \
-            -archivePath $RUNNER_TEMP/Runner.xcarchive \
-            -exportOptionsPlist ios/ExportOptions.plist \
-            -exportPath $RUNNER_TEMP/ipa_output \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath ~/private_keys/AuthKey_${APP_STORE_API_KEY_ID}.p8 \
-            -authenticationKeyID ${APP_STORE_API_KEY_ID} \
-            -authenticationKeyIssuerID ${APP_STORE_API_ISSUER_ID}
-```
-
-## ExportOptions.plist
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>method</key>
-    <string>app-store</string>
-    <key>destination</key>
-    <string>upload</string>
-    <key>teamID</key>
-    <string>YOUR_TEAM_ID</string>
-</dict>
-</plist>
-```
-
-`destination: upload` — IPA автоматически загружается в App Store Connect из `xcodebuild -exportArchive`.
+Ключевые настройки:
+- Runner: `macos-14` (Xcode 16.2)
+- Flutter: `subosito/flutter-action@v2` с версией 3.24.5
+- Signing: Automatic + API Key (`-allowProvisioningUpdates`)
+- Export: `destination: upload` в ExportOptions.plist (автозагрузка)
 
 ## GitHub Secrets
 
@@ -249,70 +221,48 @@ jobs:
 | `APP_STORE_API_KEY_P8` | Содержимое .p8 файла API ключа |
 | `PROVISION_PROFILE_BASE64` | Provisioning profile в base64 (если manual signing) |
 
-### Как получить секреты
-
-**Сертификат:**
-1. Keychain Access → Apple Distribution сертификат → Export → .p12
-2. `base64 -i cert.p12 | pbcopy`
-
-**API Key:**
-1. App Store Connect → Users & Access → Integrations → App Store Connect API
-2. Generate API Key (Admin role)
-3. Скачать .p8 файл (доступен однократно!)
-
-**Provisioning Profile:**
-1. Apple Developer → Certificates, IDs & Profiles → Profiles
-2. Создать App Store profile для Bundle ID
-3. `base64 -i profile.mobileprovision | pbcopy`
-
 ## Документация для App Store
 
-Для публикации нужны HTML-страницы (размести на своём сервере):
+Для публикации нужны HTML-страницы на сервере:
 
-- **Политика конфиденциальности** (`privacy.html`) — обязательна
-- **Страница поддержки** (`support.html`) — обязательна
-- **Авторские права** (`copyright.html`) — рекомендуется
-
-Шаблон политики конфиденциальности должен содержать:
-1. Какие данные собираются
-2. Цели обработки
-3. Передача третьим лицам
-4. Хранение и защита данных
-5. Права пользователя
-6. Контакты
+- **Политика конфиденциальности** — обязательна
+- **Страница поддержки** — обязательна
+- **Авторские права** — рекомендуется
 
 ## Частые ошибки сборки
 
 | Ошибка | Решение |
 |--------|---------|
+| CocoaPods version conflict (Podfile.lock) | Удали `ios/Podfile.lock` — CI сгенерирует свежий |
 | iOS 18 SDK not installed | Используй runner `macos-14` или `macos-15` |
-| Non-modular header | Добавь `CLANG_ALLOW_NON_MODULAR_INCLUDES_IN_FRAMEWORK_MODULES=YES` |
+| Non-modular header | `CLANG_ALLOW_NON_MODULAR_INCLUDES_IN_FRAMEWORK_MODULES=YES` |
 | No signing certificate | Проверь P12_BASE64 secret и пароль |
-| No profiles for bundle ID | Создай provisioning profile или используй Automatic signing |
-| Alpha channel in icons | Конвертируй: `sips -s format bmp icon.png --out tmp.bmp && sips -s format png tmp.bmp --out icon.png` |
+| No profiles for bundle ID | Automatic signing + API Key или создай profile |
+| Alpha channel in icons | `sips -s format bmp icon.png --out tmp.bmp && sips -s format png tmp.bmp --out icon.png` |
 | Missing orientations for iPad | Добавь `UIInterfaceOrientationPortraitUpsideDown` в Info.plist |
-| Firebase Swift 6 incompatibility | Понизь до `firebase_core ^2.x` / `firebase_messaging ^14.x` |
+| Firebase Swift 6 incompatibility | Удали Podfile.lock — на Xcode 16 в CI новые версии работают |
+| Build number already used | Увеличь число после `+` в pubspec.yaml |
 
 ## Скриншоты для App Store
 
-Требуемые размеры:
-- **iPhone 6.7"** (1290x2796) — iPhone 15 Pro Max
-- **iPhone 6.5"** (1284x2778) — iPhone 14 Plus
-- **iPhone 5.5"** (1242x2208) — iPhone 8 Plus
-- **iPad Pro 12.9"** (2048x2732) — если поддерживается iPad
-
-Минимум 1 скриншот для каждого типа устройства. Рекомендуется 3-5 скриншотов с подписями.
+| Устройство | Размер | Обязательный |
+|------------|--------|:------------:|
+| iPhone 6.7" | 1290×2796 | да |
+| iPhone 6.5" | 1284×2778 | да |
+| iPhone 5.5" | 1242×2208 | да |
+| iPad Pro 12.9" | 2048×2732 | если iPad |
 
 ## Чеклист перед публикацией
 
 - [ ] Build number увеличен
 - [ ] Код протестирован
+- [ ] `ios/Podfile.lock` удалён (если менялись Firebase версии)
 - [ ] Сборка успешно загружена в TestFlight
 - [ ] Политика конфиденциальности размещена по URL
 - [ ] Страница поддержки размещена по URL
 - [ ] Скриншоты загружены в App Store Connect
-- [ ] Описание приложения заполнено (RU + EN)
-- [ ] Категория выбрана
+- [ ] Описание приложения заполнено
 - [ ] Возрастной рейтинг заполнен
-- [ ] Информация о шифровании указана (Export Compliance)
-- [ ] Контактная информация для ревью заполнена
+- [ ] Export Compliance указан
+- [ ] Review Notes с тестовым аккаунтом заполнены
+- [ ] Нет упоминаний Google Play в iOS-приложении
